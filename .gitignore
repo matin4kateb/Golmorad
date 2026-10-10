@@ -1,1 +1,6 @@
 .env
+__pycache__/
+*.py[cod]
+Database/*.db
+Database/*.db-shm
+Database/*.db-wal
