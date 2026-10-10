@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
+from urllib.parse import urlparse
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +24,20 @@ def utc_now() -> str:
 
 def _json(value: Any) -> str | None:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str) if value is not None else None
+
+
+def safe_error_detail(error: str | Exception) -> str:
+    """Strip URL credentials and query strings before persisting/displaying errors."""
+    message = f"{type(error).__name__}: {error}" if isinstance(error, Exception) else str(error)
+
+    def origin_only(match: re.Match[str]) -> str:
+        parsed = urlparse(match.group(0).rstrip(".,;:)]}"))
+        return f"{parsed.scheme}://{parsed.hostname or 'redacted-host'}"
+
+    message = re.sub(r"https?://[^\s\"'<>]+", origin_only, message, flags=re.IGNORECASE)
+    message = re.sub(r"(?i)(api[_ -]?key|token|secret|password)\s*[:=]\s*\S+",
+                     r"\1=<redacted>", message)
+    return message[:2000]
 
 
 class SQLiteUtils:
@@ -162,3 +178,23 @@ class SQLiteUtils:
         with self.connection() as conn:
             conn.execute("UPDATE sync_runs SET finished_at=?, status=?, rows_inserted=?, error=? WHERE id=?",
                          (utc_now(), status, rows_inserted, error[:2000] if error else None, run_id))
+            # Keep operational history useful but bounded for long-running services.
+            conn.execute("DELETE FROM sync_runs WHERE id NOT IN "
+                         "(SELECT id FROM sync_runs ORDER BY id DESC LIMIT 1000)")
+
+    def get_sync_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Return recent collection outcomes for the CLI status view."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sync_runs ORDER BY started_at DESC, id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        result = [dict(row) for row in rows]
+        for row in result:
+            source = row.get("source")
+            if isinstance(source, str) and source.lower().startswith(("http://", "https://")):
+                parsed = urlparse(source)
+                row["source"] = parsed.hostname or "redacted-host"
+            if row.get("error"):
+                row["error"] = safe_error_detail(row["error"])
+        return result

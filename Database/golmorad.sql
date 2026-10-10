@@ -67,3 +67,72 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 
 CREATE INDEX IF NOT EXISTS idx_sync_runs_started
     ON sync_runs(dataset, started_at DESC);
+
+-- Paper trading is deliberately isolated from exchange order tables/clients.
+CREATE TABLE IF NOT EXISTS paper_events (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    decision_id TEXT,
+    order_id TEXT,
+    payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_decisions (
+    id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    candle_timestamp TEXT NOT NULL,
+    signal TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    source TEXT,
+    data_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(symbol, interval, candle_timestamp)
+);
+
+CREATE TABLE IF NOT EXISTS paper_orders (
+    id TEXT PRIMARY KEY,
+    decision_id TEXT NOT NULL REFERENCES paper_decisions(id),
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL CHECK(side IN ('buy', 'sell')),
+    status TEXT NOT NULL CHECK(status IN ('filled', 'partially_filled', 'rejected')),
+    decision_at TEXT NOT NULL,
+    fill_at TEXT NOT NULL,
+    requested_quantity REAL NOT NULL,
+    filled_quantity REAL NOT NULL,
+    fill_price REAL,
+    fee REAL NOT NULL,
+    spread_cost REAL NOT NULL,
+    slippage_cost REAL NOT NULL,
+    latency_seconds REAL NOT NULL,
+    liquidity_limit REAL NOT NULL,
+    realized_pnl REAL NOT NULL DEFAULT 0,
+    details_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_accounts (
+    id TEXT PRIMARY KEY,
+    initial_cash REAL NOT NULL,
+    cash REAL NOT NULL,
+    position_quantity REAL NOT NULL DEFAULT 0,
+    average_entry REAL NOT NULL DEFAULT 0,
+    realized_pnl REAL NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_control (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    stopped INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_account_marks (
+    id TEXT PRIMARY KEY,
+    marked_at TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    equity REAL NOT NULL,
+    cash REAL NOT NULL,
+    position_value REAL NOT NULL
+);

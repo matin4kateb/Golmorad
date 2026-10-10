@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from datetime import datetime, timezone
 from typing import Any
 
 from Database.SQLiteUtils import SQLiteUtils
@@ -43,10 +45,120 @@ class TechnicalAnalyzer:
             return 100.0 if avg_gain else 50.0
         return 100 - 100 / (1 + avg_gain / avg_loss)
 
-    def analyze(self, symbol: str = "BTC-USD", interval: str = "1d", limit: int = 500) -> dict[str, Any]:
-        candles = self.database.get_candles(symbol, interval, limit)
+    @staticmethod
+    def _freshness(timestamp: str, interval: str,
+                   reference_time: datetime | None = None) -> dict[str, Any]:
+        """Classify candle age with a conservative grace period for candle opens."""
+        durations = {
+            "1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800,
+            "60m": 3600, "90m": 5400, "1h": 3600, "1d": 86400,
+            "5d": 432000, "1wk": 604800, "1mo": 2592000, "3mo": 7776000,
+        }
+        duration = durations.get(interval)
+        if duration is None:
+            return {"status": "unknown", "age_seconds": None,
+                    "max_age_seconds": None}
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            reference = reference_time or datetime.now(timezone.utc)
+            if reference.tzinfo is None:
+                return {"status": "unknown", "age_seconds": None,
+                        "max_age_seconds": duration * 2}
+            age = (reference.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return {"status": "unknown", "age_seconds": None,
+                    "max_age_seconds": duration * 2}
+        if age < -300:
+            return {"status": "unknown", "age_seconds": int(age),
+                    "max_age_seconds": duration * 2}
+        age_seconds = max(0, int(age))
+        # Daily Yahoo candles are timestamped at the start of the UTC day.
+        max_age_seconds = max(duration * 2, 48 * 60 * 60 if interval == "1d" else 0)
+        return {"status": "fresh" if age_seconds <= max_age_seconds else "stale",
+                "age_seconds": age_seconds, "max_age_seconds": max_age_seconds}
+
+    @staticmethod
+    def _is_closed_candle(timestamp: str, interval: str,
+                          reference_time: datetime | None = None) -> bool:
+        """Return whether an interval candle's full time window has elapsed.
+
+        Paper fills and historical evaluation must not treat the currently
+        forming bar as a completed next-candle execution opportunity.
+        Unknown interval semantics fail closed.
+        """
+        durations = {
+            "1m": 60, "2m": 120, "5m": 300, "15m": 900, "30m": 1800,
+            "60m": 3600, "90m": 5400, "1h": 3600, "1d": 86400,
+            "5d": 432000, "1wk": 604800, "1mo": 2592000, "3mo": 7776000,
+        }
+        try:
+            opened = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            now = reference_time or datetime.now(timezone.utc)
+            if now.tzinfo is None:
+                return False
+            now = now.astimezone(timezone.utc)
+            opened = opened.astimezone(timezone.utc)
+            if interval in {"1mo", "3mo"}:
+                months = 1 if interval == "1mo" else 3
+                if opened.day != 1 or (interval == "3mo" and (opened.month - 1) % 3):
+                    return False
+                next_month = opened.year * 12 + (opened.month - 1) + months
+                boundary = datetime(next_month // 12, next_month % 12 + 1, 1, tzinfo=timezone.utc)
+                return now >= boundary
+            duration = durations.get(interval)
+            return duration is not None and (now - opened).total_seconds() >= duration
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+
+    @staticmethod
+    def _validate_candles(candles: list[dict[str, Any]]) -> str | None:
+        """Reject malformed, duplicate, or unordered source records before analysis."""
+        previous_timestamp: str | None = None
+        for index, candle in enumerate(candles):
+            timestamp = candle.get("timestamp")
+            if not isinstance(timestamp, str) or not timestamp:
+                return f"Candle {index + 1} has no valid timestamp."
+            try:
+                datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                return f"Candle {index + 1} has an invalid timestamp."
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                return "Candle timestamps are duplicated or out of order."
+            previous_timestamp = timestamp
+
+            try:
+                values = {key: float(candle[key]) for key in ("open", "high", "low", "close", "volume")}
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return f"Candle {index + 1} is missing a usable OHLCV value."
+            if any(not math.isfinite(value) for value in values.values()):
+                return f"Candle {index + 1} contains a non-finite OHLCV value."
+            prices = (values["open"], values["high"], values["low"], values["close"])
+            if (min(prices) <= 0 or values["volume"] < 0
+                    or values["high"] < max(values["open"], values["close"], values["low"])
+                    or values["low"] > min(values["open"], values["close"], values["high"])):
+                return f"Candle {index + 1} violates positive-price or OHLCV bounds."
+        return None
+
+    def analyze(self, symbol: str = "BTC-USD", interval: str = "1d", limit: int = 500,
+                *, candles: list[dict[str, Any]] | None = None,
+                reference_time: datetime | None = None) -> dict[str, Any]:
+        candles = candles if candles is not None else self.database.get_candles(symbol, interval, limit)
         if not candles:
-            return {"symbol": symbol, "interval": interval, "observations": 0, "indicators": {}}
+            return {"symbol": symbol, "interval": interval, "observations": 0,
+                    "data_quality": {"status": "empty", "reason": "No candles are stored."},
+                    "indicators": {}}
+        quality_error = self._validate_candles(candles)
+        if quality_error:
+            return {"symbol": symbol, "interval": interval, "observations": len(candles),
+                    "as_of": candles[-1].get("timestamp"),
+                    "source": candles[-1].get("source"),
+                    "freshness": self._freshness(candles[-1].get("timestamp"), interval, reference_time),
+                    "data_quality": {"status": "invalid", "reason": quality_error},
+                    "indicators": {}}
         closes = [float(row["close"]) for row in candles]
         highs = [float(row["high"]) for row in candles]
         lows = [float(row["low"]) for row in candles]
@@ -68,5 +180,8 @@ class TechnicalAnalyzer:
             "return_1": closes[-1] / previous - 1 if previous else None,
         }
         return {"symbol": symbol, "interval": interval, "observations": len(candles),
-                "as_of": latest["timestamp"], "close": closes[-1], "volume": latest["volume"],
+                "as_of": latest["timestamp"], "source": latest.get("source"),
+                "data_quality": {"status": "valid", "reason": None},
+                "freshness": self._freshness(latest["timestamp"], interval, reference_time),
+                "close": closes[-1], "volume": latest["volume"],
                 "indicators": indicators}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import email.utils
 import json
 import logging
+import math
 import os
 import time
 import xml.etree.ElementTree as ET
@@ -15,11 +16,13 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from Database.SQLiteUtils import SQLiteUtils, utc_now
+from Database.SQLiteUtils import SQLiteUtils, safe_error_detail, utc_now
 
 LOGGER = logging.getLogger(__name__)
 FEAR_GREED_URL = "https://api.alternative.me/fng/"
 DEFAULT_NEWS_FEEDS = ("https://www.coindesk.com/arc/outboundfeeds/rss/",)
+SUPPORTED_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h",
+                       "1d", "5d", "1wk", "1mo", "3mo"}
 USER_AGENT = "GolmoradKnowledgeBase/1.0 (+local crypto research application)"
 
 
@@ -58,7 +61,19 @@ class DataSeeder:
         self.symbol = os.getenv("MARKET_SYMBOL", "BTC-USD")
         self.intervals = tuple(i.strip() for i in os.getenv("MARKET_INTERVALS", "1d,1h").split(",") if i.strip())
         self.news_feeds = tuple(i.strip() for i in os.getenv("NEWS_RSS_URLS", ",".join(DEFAULT_NEWS_FEEDS)).split(",") if i.strip())
-        self.timeout = float(os.getenv("DATA_HTTP_TIMEOUT_SECONDS", "20"))
+        try:
+            self.timeout = float(os.getenv("DATA_HTTP_TIMEOUT_SECONDS", "20"))
+        except ValueError as exc:
+            raise ValueError("DATA_HTTP_TIMEOUT_SECONDS must be a finite positive number") from exc
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("DATA_HTTP_TIMEOUT_SECONDS must be a finite positive number")
+        if not self.symbol.strip():
+            raise ValueError("MARKET_SYMBOL must not be empty")
+        if not self.intervals or any(interval not in SUPPORTED_INTERVALS for interval in self.intervals):
+            raise ValueError("MARKET_INTERVALS must contain supported Yahoo Finance intervals")
+        if any(urlparse(url).scheme not in {"http", "https"} or not urlparse(url).hostname
+               for url in self.news_feeds):
+            raise ValueError("NEWS_RSS_URLS must contain absolute HTTP or HTTPS URLs")
         self._stop = Event()
         self._thread: Thread | None = None
 
@@ -73,10 +88,12 @@ class DataSeeder:
                 latest_dt = datetime.fromisoformat(latest.replace("Z", "+00:00"))
                 # Re-fetch recent data to refresh the current, potentially incomplete candle.
                 start = (latest_dt - timedelta(days=3 if interval in {"1d", "1wk", "1mo"} else 2)).date().isoformat()
-                frame = ticker.history(start=start, interval=interval, auto_adjust=False, actions=False, raise_errors=True)
+                frame = ticker.history(start=start, interval=interval, auto_adjust=False, actions=False,
+                                       raise_errors=True, timeout=self.timeout)
             else:
                 period = "max" if interval in {"1d", "1wk", "1mo"} else "730d"
-                frame = ticker.history(period=period, interval=interval, auto_adjust=False, actions=False, raise_errors=True)
+                frame = ticker.history(period=period, interval=interval, auto_adjust=False, actions=False,
+                                       raise_errors=True, timeout=self.timeout)
             fetched_at = utc_now()
             rows = []
             if frame is not None and not frame.empty:
@@ -104,8 +121,9 @@ class DataSeeder:
             LOGGER.info("Stored %d %s %s candles", count, self.symbol, interval)
             return count
         except Exception as exc:
-            self.database.finish_sync(run_id, status="failed", error=f"{type(exc).__name__}: {exc}")
-            LOGGER.exception("Candle update failed for %s %s", self.symbol, interval)
+            safe_error = safe_error_detail(exc)
+            self.database.finish_sync(run_id, status="failed", error=safe_error)
+            LOGGER.error("Candle update failed for %s %s (%s)", self.symbol, interval, safe_error)
             return 0
 
     def _collect_fear_greed(self) -> int:
@@ -129,13 +147,15 @@ class DataSeeder:
             LOGGER.info("Stored %d fear-and-greed observations", count)
             return count
         except Exception as exc:
-            self.database.finish_sync(run_id, status="failed", error=f"{type(exc).__name__}: {exc}")
-            LOGGER.exception("Fear-and-greed update failed")
+            safe_error = safe_error_detail(exc)
+            self.database.finish_sync(run_id, status="failed", error=safe_error)
+            LOGGER.error("Fear-and-greed update failed (%s)", safe_error)
             return 0
 
     def _collect_news_feed(self, feed_url: str) -> int:
-        host = urlparse(feed_url).netloc.lower() or "rss"
-        run_id = self.database.start_sync(f"news:{host}", feed_url)
+        host = urlparse(feed_url).hostname or "rss"
+        host = host.lower()
+        run_id = self.database.start_sync(f"news:{host}", host)
         try:
             root = ET.fromstring(_http_get(feed_url, self.timeout))
             fetched_at = utc_now()
@@ -167,8 +187,9 @@ class DataSeeder:
             LOGGER.info("Stored %d Bitcoin news items from %s", count, host)
             return count
         except Exception as exc:
-            self.database.finish_sync(run_id, status="failed", error=f"{type(exc).__name__}: {exc}")
-            LOGGER.exception("News update failed for %s", feed_url)
+            safe_error = safe_error_detail(exc)
+            self.database.finish_sync(run_id, status="failed", error=safe_error)
+            LOGGER.error("News update failed for %s (%s)", host, safe_error)
             return 0
 
     def run_once(self) -> dict[str, int]:
@@ -188,16 +209,26 @@ class DataSeeder:
         self.database.initialize()
         self._stop.clear()
 
+        def run_cycle() -> None:
+            try:
+                self.run_once()
+            except Exception as exc:
+                # Keep the scheduler alive after database or orchestration
+                # failures and retry only after the configured wait.
+                LOGGER.error("Data collection cycle failed (%s)", safe_error_detail(exc))
+
         def loop() -> None:
             if run_immediately:
-                self.run_once()
+                run_cycle()
             while not self._stop.wait(interval_seconds):
-                self.run_once()
+                run_cycle()
 
-        self._thread = Thread(target=loop, name="golmorad-data-seeder", daemon=True)
+        self._thread = Thread(target=loop, name="golmorad-data-seeder", daemon=False)
         self._thread.start()
 
-    def stop(self, timeout: float = 30) -> None:
+    def stop(self, timeout: float | None = None) -> None:
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout)
+            if self._thread.is_alive():
+                raise TimeoutError("Data collection is still running; shutdown did not complete cleanly")
